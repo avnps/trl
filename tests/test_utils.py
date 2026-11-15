@@ -2338,6 +2338,32 @@ class TestComputeFlopsPerToken(TrlTestCase):
         cfg.head_dim = cfg.hidden_size // cfg.num_attention_heads
         assert compute_flops_per_token(cfg, 16384) == derived
 
+    @pytest.mark.skipif(
+        Version(transformers.__version__) < Version("5.20.1"),
+        reason="Beam was introduced in transformers-5.20.1",
+    )
+    def test_beam_active_weights_and_sliding_window(self):
+        # At `seq_len=0`, only the weight matmuls contribute, which must equal `6 * active_weights`. Above
+        # `sliding_window`, only the full-attention layers scale with `seq_len`.
+        cfg = AutoConfig.from_pretrained("trl-internal-testing/tiny-BeamForCausalLM")
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(cfg)
+        active_weights = 0
+        for name, param in model.named_parameters():
+            if "embed_tokens" in name or "norm" in name or "bias" in name:
+                continue
+            if "experts." in name:
+                active_weights += (param.numel() // cfg.num_experts) * cfg.num_experts_per_tok
+            else:
+                active_weights += param.numel()
+        assert compute_flops_per_token(cfg, 0) == 6 * active_weights
+
+        full_attn_layers = sum(1 for t in cfg.layer_types if t == "full_attention")
+        f_window = compute_flops_per_token(cfg, cfg.sliding_window)
+        f_double = compute_flops_per_token(cfg, 2 * cfg.sliding_window)
+        expected_delta = 3 * full_attn_layers * 2 * 2 * cfg.num_attention_heads * cfg.head_dim * cfg.sliding_window
+        assert f_double - f_window == expected_delta
+
     @pytest.mark.parametrize(
         "model_id",
         [

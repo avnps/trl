@@ -1785,6 +1785,7 @@ def add_fused_lm_head(
 # Model types whose layers `compute_flops_per_token` describes: full attention in every layer, and a gate/up/down MLP
 # or routed experts of that shape. For each, the estimate matches 6 FLOPs per active weight on real checkpoints.
 _FLOPS_PER_TOKEN_MODEL_TYPES = (
+    "beam",
     "gemma",
     "granite",
     "llama",
@@ -1826,6 +1827,29 @@ def compute_flops_per_token(config: PretrainedConfig, seq_len: int) -> int | Non
     # `head_dim` is optional on configs: Llama and Mistral declare it, Qwen2 doesn't. Derive it when missing, like
     # transformers' own modeling code does.
     head_dim = getattr(config, "head_dim", None) or h // n_heads
+
+    if config.model_type == "beam":
+        # Attention: Q/K/V/O projections + output gate projection (`gate_proj`) + attention score, capped at
+        # `sliding_window` on sliding-attention layers.
+        qkv_flops = 2 * h * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
+        o_proj_flops = 2 * n_heads * head_dim * h
+        gate_proj_flops = 2 * h * n_heads * head_dim
+        moe_mlp_flops = config.num_experts_per_tok * 2 * 3 * h * config.moe_intermediate_size
+        moe_mlp_flops += 2 * h * config.num_experts
+        dense_mlp_flops = 2 * 3 * h * config.intermediate_size
+        total_layer_flops = 0
+        for layer_type, mlp_layer_type in zip(config.layer_types, config.mlp_layer_types, strict=True):
+            attn_seq_len = (
+                min(seq_len, config.sliding_window)
+                if layer_type == "sliding_attention" and config.sliding_window is not None
+                else seq_len
+            )
+            attn_score_flops = 2 * 2 * n_heads * head_dim * attn_seq_len
+            attn_flops = qkv_flops + o_proj_flops + gate_proj_flops + attn_score_flops
+            mlp_flops = moe_mlp_flops if mlp_layer_type == "sparse" else dense_mlp_flops
+            total_layer_flops += attn_flops + mlp_flops
+        lm_head_flops = 2 * V * h
+        return 3 * (total_layer_flops + lm_head_flops)
 
     # Attention: Q/K/V/O projections + attention score (Q·Kᵀ and attn·V).
     qkv_flops = 2 * h * (n_heads * head_dim + 2 * n_kv_heads * head_dim)
