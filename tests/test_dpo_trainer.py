@@ -570,6 +570,40 @@ class TestDPOTrainer(TrlTestCase):
         assert z != 0.0
         assert metrics["eval_loss"] == pytest.approx(-alpha * math.log1p(-(1 - a) / (math.exp(z) + 1)), rel=1e-4)
 
+    def test_discopop_finite_with_large_negative_margin(self):
+        # Regression test: the DiscoPOP exponential term `exp(-logits)` overflows to `inf` for large negative logits
+        # while its sigmoid weight underflows to 0, which used to give `inf * 0 = NaN` in the loss and its gradients.
+        # Two contradictory preference pairs guarantee that after the first step pushes the policy toward the first
+        # pair, the second pair gets a large negative margin.
+        dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
+        pair = dataset[0]
+        swapped_pair = {"prompt": pair["prompt"], "chosen": pair["rejected"], "rejected": pair["chosen"]}
+        dataset = Dataset.from_list([pair, swapped_pair])
+
+        training_args = DPOConfig(
+            output_dir=self.tmp_dir,
+            loss_type="discopop",
+            beta=500.0,
+            learning_rate=0.1,  # move the policy away from the reference model, so that the reward margin is non-zero
+            lr_scheduler_type="constant",
+            max_grad_norm=0.0,
+            max_steps=3,
+            per_device_train_batch_size=1,
+            report_to="none",
+        )
+        trainer = DPOTrainer(
+            model="trl-internal-testing/tiny-Qwen2ForCausalLM-2.5",
+            args=training_args,
+            train_dataset=dataset,
+        )
+
+        trainer.train()
+
+        assert math.isfinite(trainer.state.log_history[-1]["train_loss"])
+        # A NaN gradient would propagate to the parameters through the optimizer step
+        for n, param in trainer.model.named_parameters():
+            assert torch.isfinite(param).all(), f"Parameter {n} is not finite."
+
     def test_udpo_label_smoothing_out_of_range_raises(self):
         dataset = load_dataset("trl-internal-testing/zen", "conversational_preference", split="train")
 

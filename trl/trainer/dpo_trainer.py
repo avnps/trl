@@ -1561,13 +1561,15 @@ class DPOTrainer(_BaseTrainer):
                 # Eqn (5) of the DiscoPOP paper (https://huggingface.co/papers/2406.08414)
                 logits = delta_score * self.beta
                 # Modulate the mixing coefficient based on the log ratio magnitudes
-                log_ratio_modulation = torch.sigmoid(logits / self.args.discopop_tau)
+                scaled_logits = logits / self.args.discopop_tau
+                log_ratio_modulation = torch.sigmoid(scaled_logits)
                 logistic_component = -F.logsigmoid(logits)
-                exp_component = torch.exp(-logits)
+                # `exp(-logits) * sigmoid(scaled_logits)` is evaluated in log space: computing the two factors separately
+                # overflows `exp(-logits)` to `inf` for large negative logits while the sigmoid underflows to 0, which
+                # gives `inf * 0 = NaN` (in the loss and in its gradients).
+                exp_modulated_component = torch.exp(-logits + F.logsigmoid(scaled_logits))
                 # Blend between logistic and exponential component based on log ratio modulation
-                per_sequence_loss = (
-                    logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
-                )
+                per_sequence_loss = logistic_component * (1 - log_ratio_modulation) + exp_modulated_component
 
             elif loss_type == "sft":
                 chosen_mask, _ = shift_completion_mask.chunk(2, dim=0)
